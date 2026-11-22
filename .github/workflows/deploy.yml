@@ -1,0 +1,74 @@
+name: ERP CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: erp-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-test-publish:
+    name: Build and smoke-test ERP
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and start the Compose stack
+        run: docker compose up -d --build --wait --wait-timeout 90
+
+      - name: Check frontend and database-backed API
+        run: |
+          curl_options=(--fail --silent --show-error --max-time 10 --retry 8 --retry-all-errors --retry-delay 2)
+          frontend_url=http://127.0.0.1:3000
+          backend_url=http://127.0.0.1:5000
+
+          page=$(curl "${curl_options[@]}" "$frontend_url/")
+          asset_path=$(sed -nE 's/.*src="(\/assets\/[^" ]+\.js)".*/\1/p' <<< "$page")
+          test -n "$asset_path"
+          curl "${curl_options[@]}" --output /dev/null "$frontend_url$asset_path"
+
+          curl "${curl_options[@]}" "$backend_url/health" | jq -e '.status == "healthy"'
+          curl "${curl_options[@]}" "$backend_url/api/dashboard/stats" | jq -e '.inventoryValue > 0'
+          curl "${curl_options[@]}" "$backend_url/api/orders" | jq -e '.orders | type == "array" and length > 0'
+          curl "${curl_options[@]}" "$backend_url/api/inventory" | jq -e 'type == "array" and length > 0'
+
+      - name: Sign in to Docker Hub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish the tested images
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          BACKEND_IMAGE: cloudspacev2/erp-backend:thebyteforce
+          FRONTEND_IMAGE: cloudspacev2/erp-frontend:thebyteforce
+        run: |
+          docker tag "$(docker compose images --quiet backend)" "$BACKEND_IMAGE"
+          docker tag "$(docker compose images --quiet frontend)" "$FRONTEND_IMAGE"
+          docker push "$BACKEND_IMAGE"
+          docker push "$FRONTEND_IMAGE"
+
+      - name: Show Compose logs after a failure
+        if: failure()
+        run: docker compose logs --no-color --tail 100
+
+      - name: Stop the Compose stack
+        if: always()
+        run: docker compose down --volumes
